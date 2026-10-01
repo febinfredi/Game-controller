@@ -1,81 +1,56 @@
 #include <SPI.h>
 #include <Arduino.h>
 #include <SimpleFOC.h>
+#include <Preferences.h>
+#include <SimpleFOCDrivers.h>                      
+#include "encoders/mt6835/MagneticSensorMT6835.h"
 
-
-#ifdef IS_LEONARDO
-#elif IS_NANO
-  // Pin definitions
-  // MT6835 SPI pins
-  const int MT6835_CSN_PIN = 10;
-  // Motor driver pins
-  const int EN_PIN = 8;
-  const int IN1_PIN = 3;
-  const int IN2_PIN = 6;
-  const int IN3_PIN = 9;
-  
-  BLDCMotor motor = BLDCMotor(11); // (pole pair number, phase resistance (optional));
-  BLDCDriver3PWM driver = BLDCDriver3PWM(IN1_PIN, IN2_PIN, IN3_PIN, EN_PIN); // (phA, phB, phC, enable)
-
-  // calibration variables
-  float min_angle = 0;
-  float max_angle = 0;
-  int zone = 0;
-#endif
-
-
-// flag to indicate calibrate mode
-int calibration_mode = 1;
-
-
-// function to get angle
-float getAngle() {
-    uint16_t command = (0x3 << 12) | (0x003 & 0xFFF);
-
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-
-    digitalWrite(MT6835_CSN_PIN, LOW);
-
-    SPI.transfer16(command);
-    uint8_t data0 = SPI.transfer(0x00);
-    uint8_t data1 = SPI.transfer(0x00);
-    uint8_t data2 = SPI.transfer(0x00);
-    uint8_t data3 = SPI.transfer(0x00);
-
-    digitalWrite(MT6835_CSN_PIN, HIGH);
-
-    SPI.endTransaction();
-
-    uint32_t data = ((uint32_t)data0 << 13) | (data1 << 5) | (data2 >> 3);
-
-    float angle_deg = (double)data / 2097152.0 * 360.0;
-
-    // Check warnings
-    uint8_t status = data2 & 0x7;
-    if (status & 0x01) {
-        Serial.println("Warning : overspeed!");
-        angle_deg = -1; // invalid angle
+// Reset SimpleFOC sensor members (int32_t Sensor::full_rotations and float Sensor::angle_prev)
+class SensorInspector : public Sensor {
+public:
+    void forceReset() {
+        full_rotations = 0;
+        angle_prev = 0;
     }
-    if (status & 0x02) {
-        Serial.println("Warning : Low magnetic field!");
-        angle_deg = -1; // invalid angle
-    }
-    if (status & 0x04) {
-        Serial.println("Warning : Low voltage!");
-        angle_deg = -1; // invalid angle
-    }
+};
 
-    return angle_deg;
-}
+// Pin definitions for ESP32
+const int MT6835_CSN_PIN = 5;
+const int EN_PIN = 33;
+const int IN1_PIN = 25;
+const int IN2_PIN = 26;
+const int IN3_PIN = 27;
+
+// variables for setting min and max range of lever motion
+float min_angle = 0.0;  // joystick min angle - for calibration 
+float max_angle = 0.0;  // joystick max angle - for calibration
+int zone = 0;
+float err = 0.0;    // error = target - current_val
+float tq_out = 0.0;     // output torque voltage  
+float target_angle = 0.00;  
+float zero_elec_angle = 10.0;   // variable to store motor.zero_electric_angle value
+int sensor_direction = 0;   // variable to store motor.sensor_direction value
+bool calib_done = false;    // flag to check if calibration has been performed once
+int ctr_calib = 0;  // counter for calibration
+bool calibration_mode = 0;  // flag to enter calibrate mode
+
+// parameters for spring torque     
+const float SNAP_STRENGTH = 12.0;
+const float SPRING_DAMPING_FACTOR = 0.002; 
+
+// parameters for friction torque
+const float CONSTANT_DRAG = 2.0; 
+const float FADE_START_VELOCITY = 1.2;  // velocity where drag starts scaling down 
+const float DEADZONE = 0.1; 
+const float FRICTION_DAMPING_FACTOR = 0.04;
 
 
-float readMySensorCallback(){
-    // read my sensor
-    // return the angle value in radians in between 0 and 2PI
-    double angle_deg = getAngle();
-    return (float)(angle_deg * M_PI / 180.0);
-}
+// Use GPIO 18 (SCK), 19 (MISO), 23 (MOSI) by default
+BLDCMotor motor = BLDCMotor(11, 9.8, 52.8); 
+BLDCDriver3PWM driver = BLDCDriver3PWM(IN1_PIN, IN2_PIN, IN3_PIN, EN_PIN);
 
+// create an instance of preferences library
+Preferences prefs;
 
 char getChar() {
     while (Serial.available() == 0) {}
@@ -85,65 +60,127 @@ char getChar() {
 }
 
 
-// function to calibrate the motor movement range
-void calibrateMotor(){
-    Serial.println("Starting calibration...");
-    
-    // get min angle
-    Serial.println("Rotate to min angle and press 'y' to confirm or any other key to display the current min angle");
-    while (getChar() != 'y') {
-        Serial.println("Min angle read: " + String(readMySensorCallback()) + " rad");
-        Serial.println("Press 'y' to confirm the min angle \n");
-    }
-    min_angle = readMySensorCallback();
-    Serial.println("Min angle recorded: " + String(min_angle) + " rad\n");
+void calibrate(Sensor& sens, BLDCMotor& mot, Preferences& pref){
 
-    // get max angle
-    Serial.println("Rotate to max angle and press 'y' to confirm or any other key to display the current max angle");
-    while (getChar() != 'y') {
-        Serial.println("Max angle read: " + String(readMySensorCallback()) + " rad");
-        Serial.println("Press 'y' to confirm the max angle \n");
+    // calibrate Motor min and max angle
+    Serial.println("Starting calibration...");
+
+    min_angle = 0.0;
+    max_angle = 0.0;
+
+    // get min angle
+    Serial.println("Rotate to min angle and press 'y' to confirm and then same step for max angle and press any other key for reading current angle");
+    while (ctr_calib!=2){
+        motor.loopFOC();
+        if (Serial.available() > 0){
+            char incoming_char = Serial.read();
+            if (incoming_char != '\n' && incoming_char != '\r') {
+                if (incoming_char == 'y' && ctr_calib==0) {
+                    Serial.println("Min angle read: " + String(sens.getAngle()) + " rad");
+                    min_angle = sens.getAngle();
+                    ctr_calib+=1;
+                }
+                else if (incoming_char == 'y' && ctr_calib==1) {
+                    Serial.println("Max angle read: " + String(sens.getAngle()) + " rad");
+                    max_angle = sens.getAngle();
+                    ctr_calib+=1;
+                }
+                else {
+                    Serial.println("Current Angle read: " + String(sens.getAngle()) + " rad");
+                }   
+            }
+        }
+    }    
+
+    if (ctr_calib==2) {
+        // preferences R/W mode
+        Serial.println("Writing min and max angle to memory...");
+        pref.begin("motor_params", false);
+        pref.putBool("calib_done", true);
+        pref.putFloat("min_angle", min_angle);
+        pref.putFloat("max_angle", max_angle);
+        pref.end();
     }
-    max_angle = readMySensorCallback();
-    Serial.println("Max angle recorded: " + String(max_angle) + " rad\n");
+    
+    mot.loopFOC();
 }
 
 
-// GenericSensor class constructor
-//  - readCallback pointer to the function reading the sensor angle
-//  - initCallback pointer to the function initialising the sensor (optional)
-GenericSensor MT6835 = GenericSensor(readMySensorCallback);
+float spring_tq(Sensor& sens, BLDCMotor& mot, float target){
+    // set controller type 
+    mot.torque_controller = TorqueControlType::voltage;
+    // return calculated torque
+    // Serial.println(1*((SNAP_STRENGTH*(target - sensor.getAngle())) - (SPRING_DAMPING_FACTOR*(motor.shaft_velocity))));
+    return -1*((SNAP_STRENGTH*(target - (sens.getAngle()-min_angle))) - (SPRING_DAMPING_FACTOR*(motor.shaft_velocity)));
+}
 
 
-// timestamp for changing direction
-unsigned long timestamp_us = _micros();
+float friction_tq(Sensor& sens, BLDCMotor& mot){
+    // set controller type 
+    mot.controller = MotionControlType::torque;
+    mot.torque_controller = TorqueControlType::voltage;
 
-float target_angle = 0.0;
+    float damp = -1 * FRICTION_DAMPING_FACTOR * mot.shaft_velocity;
+
+    if (abs(mot.shaft_velocity) > FADE_START_VELOCITY) {
+        // drag opposing the direction
+        if (mot.shaft_velocity > 0) return -CONSTANT_DRAG + damp;
+        else return CONSTANT_DRAG + damp;
+    } 
+    else if (abs(mot.shaft_velocity) > DEADZONE) {
+        // smoothly transition drag from max to 0
+        float fade_factor = (abs(mot.shaft_velocity) - DEADZONE) / (FADE_START_VELOCITY - DEADZONE);
+        if (mot.shaft_velocity > 0) return (-CONSTANT_DRAG * fade_factor) + damp;
+        else return (CONSTANT_DRAG * fade_factor) + damp;
+    } 
+    else {
+        // zero drag when completely stopped
+        return 0.0;
+    }
+}
+
+
+// Instantiate the specialized MT6835 sensor class natively
+MagneticSensorMT6835 sensor = MagneticSensorMT6835(MT6835_CSN_PIN);
 
 
 void setup() {
     // Serial communication initialisation
     Serial.begin(115200);
 
-
     // FOR MT6835 SENSOR INITIALIZATION
     // Configuration of the CSN pin
     pinMode(MT6835_CSN_PIN, OUTPUT);
+    digitalWrite(MT6835_CSN_PIN, HIGH);
+
     // SPI communication initialisation with the MT6835 parameters
     SPI.begin();
 
-    //------------------------------------------------------------
+    // preferences R/W mode
+    prefs.begin("motor_params", false);
+    sensor_direction = prefs.getInt("sens_dir", 0);
+    zero_elec_angle = prefs.getFloat("zero_elec_ang", 10.00);
+    min_angle = prefs.getFloat("min_angle", 0.0);
+    max_angle = prefs.getFloat("max_angle", 0.0);
+    calib_done = prefs.getBool("calib_done", false);
+    prefs.end();
+
 
     // FOR MOTOR AND ENCODER INITIALIZATION
     // initialize encoder
-    MT6835.init();
+    sensor.init();
+
+    sensor.update();
+    // clear the turn counter variables out of memory
+    ((SensorInspector*)&sensor)->forceReset();
+    sensor.update();
 
     // link motor and the encoder
-    motor.linkSensor(&MT6835);
+    motor.linkSensor(&sensor);
 
     // driver config
     driver.voltage_power_supply = 24;
-    driver.voltage_limit = 6;
+    driver.voltage_limit = 12;
     if(!driver.init()){
       Serial.println("Driver init failed!");
       return;
@@ -152,80 +189,81 @@ void setup() {
     // link the motor and the driver
     motor.linkDriver(&driver);
 
-    // set motion control loop to be used
-    motor.controller = MotionControlType::angle;
- 
-    // velocity PID controller parameters
-    // default P=0.5 I = 10 D =0
-    motor.PID_velocity.P = 0.2;
-    motor.PID_velocity.I = 20;
-    motor.PID_velocity.D = 0.001;
-    // jerk control using voltage voltage ramp
-    // default value is 300 volts per sec  ~ 0.3V per millisecond
-    motor.PID_velocity.output_ramp = 1000;
-
-    // velocity low pass filtering
-    // default 5ms 
-    // the lower the less filtered
-    motor.LPF_velocity.Tf = 0.01;
-
-    // angle P controller -  default P=20
-    motor.P_angle.P = 20;
-
-    //  maximal velocity of the position control
-    // default 20
-    motor.velocity_limit = 4;
-
-    // limiting motor movements
     // limit the voltage to be set to the motor
-    // current = voltage / resistance, so try to be well under 1Amp
-    motor.voltage_limit = 12;   // [V]
+    motor.voltage_limit = 12;
 
     // init motor hardware
     if(!motor.init()){
       Serial.println("Motor init failed!");
       return;
     }
-
+    
     // align encoder and start FOC
-    motor.initFOC();
+    if (sensor_direction==-1 && zero_elec_angle!=10.0){
+        Serial.println("Valid encoder align params");
+        motor.sensor_direction = Direction::CCW;
+        motor.zero_electric_angle = zero_elec_angle;
+    }
+    else if (sensor_direction==1 && zero_elec_angle!=10.0){
+        Serial.println("Valid encoder align params");
+        motor.sensor_direction = Direction::CW;
+        motor.zero_electric_angle = zero_elec_angle;
+    }
+    else {
+        Serial.println("Invalid encoder align params: Init encoder align and start FOC");
+        if(!motor.initFOC()){
+            // if motor init fails
+            Serial.println("Motor Init Failed: DISABLING MOTOR DRIVER");
+            motor.disable();
+            while(true){delay(1000);}
 
-    Serial.println("Motor ready!");
+        }
+        else{
+        prefs.begin("motor_params", false);
+        prefs.putInt("sens_dir", motor.sensor_direction);
+        prefs.putFloat("zero_elec_ang", motor.zero_electric_angle);
+        prefs.end();
+        }
+    }
+
+    motor.loopFOC();  // run once to get a fresh shaft_angle reading
+    
+    // if calibration mode flag is high, enter calibration mode
+    if (calibration_mode || !calib_done) {
+        // calibrate Motor min and max angle
+        calibrate(sensor, motor, prefs);        
+    }
+
+    Serial.println("SETUP COMPLETE");
+
     _delay(1000);
 
-    // if calibration mode flag is high, start calibration
-    if (calibration_mode) {
-        calibrateMotor();
-    }
 }
+
+
+
+void tq_zone_profile(float minAngle, float maxAngle){
+
+}
+ 
 
 
 void loop() {
-
-	// main FOC algorithm function
+    
     motor.loopFOC();
 
-    motor.move(target_angle);
+    
+    
+    Serial.print(min_angle);
+    Serial.print(" | ");
+    Serial.print(max_angle);
+    Serial.print(" | "); 
+    Serial.print(sensor.getAngle()-min_angle);
+    // Serial.print(" | ");
+    // Serial.print(calib_done);
+    Serial.println();
+    
+    // motor.move(spring_tq(0.00));
 
-    if (_micros() - timestamp_us > 5e5) {
-
-        if (target_angle == min_angle){
-            target_angle = max_angle;
-        }
-        else if (target_angle == max_angle){
-            target_angle = min_angle;
-        }
-        else { 
-            target_angle = (min_angle + max_angle)/2.0;
-        }
-
-        Serial.println("Min angle: " + String(min_angle));
-        Serial.println("Max angle: " + String(max_angle));
-        Serial.println("Target angle: " + String(target_angle) + "\n");
-
-        timestamp_us = _micros();
-    }
-  
 
 }
-
